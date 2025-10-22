@@ -1,0 +1,1 @@
+Khởi tạo Flask app, database và Marshmallow

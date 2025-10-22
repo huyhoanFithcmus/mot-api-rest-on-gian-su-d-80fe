@@ -1,0 +1,1 @@
+Cấu hình ứng dụng (ví dụ: đường dẫn database)

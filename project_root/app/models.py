@@ -1,0 +1,1 @@
+Định nghĩa database models (Todo item)
