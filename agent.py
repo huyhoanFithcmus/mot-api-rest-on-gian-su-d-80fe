@@ -1,5 +1,3 @@
-Dưới đây là mã nguồn đã được sửa đổi dựa trên các nhận xét chi tiết của bạn. Các thay đổi tập trung vào việc khắc phục lỗi logic, cải thiện xử lý ngoại lệ bằng cách sử dụng các ngoại lệ cụ thể hơn, tích hợp logging, tách biệt rõ ràng các trách nhiệm của phương thức `apply_edits` và `commit_and_push`, và sử dụng `pathlib.Path` nhất quán hơn.
-
 ```python
 """tools.agent
 
@@ -23,7 +21,7 @@ import os
 import difflib
 import re
 import logging
-import shutil  # For potential cleanup of invalid repos
+import sys  # For logging fallback if logging module isn't configured for console output
 from pathlib import Path
 from typing import Dict, Iterable, Optional, List, Any
 
@@ -33,87 +31,70 @@ logger = logging.getLogger(__name__)
 
 try:
     from git import Repo, GitCommandError, InvalidGitRepositoryError
-except ImportError:
-    logger.warning("GitPython not found. Agent functionality will be limited (no commit/push).")
+except ImportError:  # Changed from Exception to ImportError for more specificity
     Repo = None  # type: ignore
-    # Define dummy exceptions for type hinting and to avoid NameError if GitPython is missing
-    GitCommandError = type('GitCommandError', (Exception,), {})  # type: ignore
-    InvalidGitRepositoryError = type('InvalidGitRepositoryError', (Exception,), {})  # type: ignore
+    # Define dummy classes for type hinting when GitPython is not available
+    GitCommandError = type('GitCommandError', (Exception,), {})
+    InvalidGitRepositoryError = type('InvalidGitRepositoryError', (Exception,), {})
+    logger.warning("GitPython not available. Some functionalities (commit, push, advanced repo checks) will be disabled.")
 
 try:
     # reuse helper from tools if available
     from tools.git_operations import clone_repo
     from tools.file_system import get_code_files
-except ImportError:
+except ImportError:  # Changed from Exception to ImportError
     logger.warning("tools.git_operations or tools.file_system not found. Using fallback implementations.")
-
-    # Helper for fallback clone_repo to check if a path is a git repo
-    def _is_git_repo_static(path: str) -> bool:
-        """Checks if a given path is a valid Git repository."""
-        if Repo is None:
-            return False
-        try:
-            _ = Repo(path)
-            return True
-        except InvalidGitRepositoryError:
-            return False
-        except Exception as e:
-            logger.debug(f"Unexpected error checking if {path} is a git repo: {e}")
-            return False
-
+    # fallback: simple local implementations
     def clone_repo(repo_url: str, branch: str, local_path: str) -> Optional[str]:
-        """Fallback: Clones a Git repository using GitPython if available.
-        If local_path exists and is not a valid repo, it will be removed.
-        """
+        # naive fallback: attempt using GitPython if available
         if Repo is None:
             raise RuntimeError("GitPython not available and tools.git_operations not found")
-
-        path_obj = Path(local_path)
-        if path_obj.exists():
-            if _is_git_repo_static(local_path):
-                try:
-                    repo = Repo(local_path)
-                    repo.git.checkout(branch)
-                    logger.info(f"Repository at {local_path} already exists and is valid. Checked out branch {branch}.")
-                    return local_path
-                except GitCommandError as e:
-                    logger.error(f"Git command error during checkout in existing repo {local_path}: {e}")
-                    return None
-                except Exception as e:
-                    logger.error(f"Error accessing existing repository at {local_path}: {e}")
-                    return None
-            else:
-                logger.warning(f"Path {local_path} exists but is not a valid Git repository. Removing and re-cloning.")
-                try:
-                    shutil.rmtree(local_path)
-                except OSError as e:
-                    logger.error(f"Failed to remove existing non-Git directory {local_path}: {e}")
-                    raise RuntimeError(f"Failed to clean up {local_path} for cloning.")
+        if os.path.exists(local_path):
+            # do not remove existing path
+            try:
+                repo = Repo(local_path)
+                repo.git.checkout(branch)
+                logger.info(f"Successfully checked out branch '{branch}' in existing repo at {local_path}")
+                return local_path
+            except (GitCommandError, InvalidGitRepositoryError) as e:  # Specific exceptions
+                logger.warning(f"Failed to checkout branch or open existing repo at {local_path}: {e}. Attempting re-clone.")
+                # Fallback to re-clone logic below if existing repo is problematic
+                pass  # Continue to cloning logic
 
         try:
+            logger.info(f"Cloning {repo_url} (branch={branch}) to {local_path}")
             repo = Repo.clone_from(repo_url, local_path)
             repo.git.checkout(branch)
-            logger.info(f"Successfully cloned {repo_url} to {local_path} and checked out branch {branch}.")
+            logger.info(f"Successfully cloned {repo_url} to {local_path}")
             return local_path
-        except GitCommandError as e:
-            logger.error(f"Failed to clone {repo_url} to {local_path}: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"An unexpected error occurred during cloning {repo_url} to {local_path}: {e}")
+        except GitCommandError as e:  # Specific exception
+            logger.error(f"Failed to clone {repo_url} (branch={branch}) to {local_path}: {e}")
             return None
 
     def get_code_files(repo_path: str) -> Dict[str, str]:
-        """Fallback: Simple wrapper scanning for .py files."""
+        # simple wrapper scanning for common code/text files (fallback)
         result: Dict[str, str] = {}
-        repo_path_obj = Path(repo_path)
-        for p in repo_path_obj.rglob('*.py'):  # Use rglob for efficiency
-            if p.is_file():
-                try:
-                    result[str(p)] = p.read_text(encoding='utf-8')
-                except UnicodeDecodeError:
-                    logger.warning(f"Could not decode file {p} with utf-8. Skipping.")
-                except OSError as e:
-                    logger.warning(f"Could not read file {p}: {e}. Skipping.")
+        # Define common file extensions to include
+        CODE_FILE_EXTENSIONS = (
+            '.py', '.js', '.ts', '.java', '.c', '.cpp', '.h', '.hpp', '.go', '.rs', '.rb', '.php',
+            '.html', '.css', '.json', '.yaml', '.yml', '.md', '.txt', '.xml', '.sh', '.bash', '.zsh'
+        )
+        # Define common directories to exclude
+        EXCLUDE_DIRS = ('.git', '.venv', '__pycache__', 'node_modules', 'build', 'dist', '.idea', '.vscode')
+
+        for root, dirs, files in os.walk(repo_path):
+            # Modify dirs in-place to skip excluded directories for os.walk
+            dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS and not d.startswith('.')]
+
+            for f in files:
+                if f.endswith(CODE_FILE_EXTENSIONS):
+                    p = Path(root) / f
+                    try:
+                        result[str(p)] = p.read_text(encoding='utf-8')
+                    except UnicodeDecodeError:  # Specific exception for file content issues
+                        logger.warning(f"Could not decode file {p} with utf-8. Skipping.")
+                    except IOError as e:  # Catch other IO errors
+                        logger.warning(f"Could not read file {p}: {e}. Skipping.")
         return result
 
 
@@ -131,132 +112,101 @@ class Agent:
         ("Private Key PEM", re.compile(r"-----BEGIN PRIVATE KEY-----")),
         ("RSA PRIVATE KEY", re.compile(r"-----BEGIN RSA PRIVATE KEY-----")),
         ("JWT token", re.compile(r"eyJ[0-9A-Za-z_\\-]+\.[0-9A-Za-z_\\-]+\.[0-9A-Za-z_\\-]+")),
-        # Generic API Key is very broad and may produce false positives.
-        # Use with caution and consider more specific patterns if possible.
         ("Generic API Key", re.compile(r"[A-Za-z0-9]{32,}")),
     ]
 
     def __init__(self, repo_url: str, branch: str = 'main', local_path: str | Path = './temp_repo', auto_push: bool = False) -> None:
         self.repo_url = repo_url
         self.branch = branch
-        self.local_path: Path = Path(local_path)  # Store as Path object
-        self._repo: Optional[Repo] = None
+        self.local_path = str(local_path)
+        self._repo: Optional[Repo] = None  # Explicitly type _repo
         # track files most recently written by apply_edits for preview/dry-run
-        self._last_written_paths: List[Path] = []  # Store as Path objects
+        self._last_written_paths: List[str] = []
         # if True, apply_edits will automatically commit and push (use with caution)
         self.auto_push = bool(auto_push)
 
-    def _is_git_repo(self, path: Path) -> bool:
-        """Checks if a given path is a valid Git repository."""
+    def _get_git_repo(self) -> Repo:
+        """Ensures self._repo is initialized and returns it. Raises RuntimeError if GitPython is not available or repo is invalid."""
         if Repo is None:
-            return False
-        try:
-            _ = Repo(path)
-            return True
-        except InvalidGitRepositoryError:
-            return False
-        except Exception as e:
-            logger.debug(f"Unexpected error checking if {path} is a git repo: {e}")
-            return False
+            raise RuntimeError('GitPython is not available. Cannot perform Git operations.')
+        if self._repo is None:
+            try:
+                self._repo = Repo(self.local_path)
+            except InvalidGitRepositoryError:
+                raise RuntimeError(f"Path '{self.local_path}' is not a valid Git repository.")
+            except Exception as e:  # Catch other potential issues during Repo initialization
+                raise RuntimeError(f"Failed to initialize Git repository at '{self.local_path}': {e}")
+        return self._repo
 
-    def ensure_repo(self) -> Path:
+    def ensure_repo(self) -> str:
         """Ensure repository is cloned locally and set self._repo.
 
         Returns the local path of the repository.
-        Raises RuntimeError if cloning or repository access fails.
         """
-        # if local path exists and is a git repo, open it
-        if self.local_path.exists():
-            if self._is_git_repo(self.local_path):
-                try:
-                    # _is_git_repo already checked Repo is not None
-                    self._repo = Repo(self.local_path)
-                    # try checkout
+        # If local path exists, try to open it as a git repo
+        if os.path.exists(self.local_path):
+            try:
+                if Repo is None:
+                    # If GitPython is not available, rely on clone_repo fallback
+                    path = clone_repo(self.repo_url, self.branch, self.local_path)
+                    if not path:
+                        raise RuntimeError(f"Failed to clone {self.repo_url} (branch={self.branch}) without GitPython.")
+                    return path
+                else:
+                    # GitPython is available, try to open existing repo
+                    repo = self._get_git_repo()  # Use the helper to get repo
                     try:
-                        self._repo.git.checkout(self.branch)
-                        logger.info(f"Repository at {self.local_path} already exists and is valid. Checked out branch {self.branch}.")
+                        repo.git.checkout(self.branch)
+                        logger.info(f"Checked out branch '{self.branch}' in existing repo at '{self.local_path}'")
                         return self.local_path
-                    except GitCommandError:
-                        # branch may not exist locally; try fetch + checkout
-                        logger.info(f"Branch {self.branch} not found locally. Attempting to fetch and checkout.")
+                    except GitCommandError as e:
+                        logger.warning(f"Branch '{self.branch}' not found locally or checkout failed: {e}. Attempting fetch and checkout.")
                         try:
-                            origin = self._repo.remote(name='origin')
+                            origin = repo.remote(name='origin')
                             origin.fetch()
-                            self._repo.git.checkout(self.branch)
-                            logger.info(f"Successfully fetched and checked out branch {self.branch}.")
+                            repo.git.checkout(self.branch)
+                            logger.info(f"Fetched and checked out branch '{self.branch}' in existing repo at '{self.local_path}'")
                             return self.local_path
-                        except GitCommandError as e:
-                            logger.error(f"Failed to fetch and checkout branch {self.branch}: {e}")
-                            raise RuntimeError(f"Failed to checkout branch {self.branch} in {self.local_path}.")
-                        except Exception as e:
-                            logger.error(f"An unexpected error occurred during fetch/checkout: {e}")
-                            raise RuntimeError(f"An unexpected error occurred during fetch/checkout in {self.local_path}.")
-                except InvalidGitRepositoryError:
-                    # This should ideally not happen if _is_git_repo returned True, but for safety
-                    logger.warning(f"Path {self.local_path} was identified as a repo but GitPython failed to open it. Attempting re-clone.")
-                    # Fall through to re-clone logic
-                except Exception as e:
-                    logger.error(f"An unexpected error occurred while opening existing repository {self.local_path}: {e}")
-                    # Fall through to re-clone logic
-            else:
-                logger.warning(f"Path {self.local_path} exists but is not a valid Git repository. Removing and re-cloning.")
-                try:
-                    shutil.rmtree(self.local_path)
-                except OSError as e:
-                    logger.error(f"Failed to remove existing non-Git directory {self.local_path}: {e}")
-                    raise RuntimeError(f"Failed to clean up {self.local_path} for cloning.")
+                        except GitCommandError as fetch_e:
+                            logger.error(f"Failed to fetch and checkout branch '{self.branch}': {fetch_e}. Attempting re-clone.")
+                            # Fall through to re-clone logic
+                        except Exception as other_e:  # Catch other unexpected errors during fetch/checkout
+                            logger.error(f"An unexpected error occurred during fetch/checkout: {other_e}. Attempting re-clone.")
+                            # Fall through to re-clone logic
+            except RuntimeError as e:  # Catch errors from _get_git_repo or clone_repo
+                logger.warning(f"Problem with existing repository at '{self.local_path}': {e}. Attempting re-clone.")
+            except Exception as e:  # Catch any other unexpected errors before re-clone
+                logger.warning(f"An unexpected error occurred while trying to use existing repo: {e}. Attempting re-clone.")
 
-        # If we reach here, either local_path didn't exist, or it was invalid and removed.
-        path_str = clone_repo(self.repo_url, self.branch, str(self.local_path))  # clone_repo expects str
-        if not path_str:
+        # If we reach here, either local_path didn't exist, or there was an issue with the existing repo.
+        logger.info(f"Cloning {self.repo_url} (branch={self.branch}) to '{self.local_path}'")
+        path = clone_repo(self.repo_url, self.branch, self.local_path)
+        if not path:
             raise RuntimeError(f"Failed to clone {self.repo_url} (branch={self.branch})")
 
-        self.local_path = Path(path_str)  # Ensure self.local_path is updated if clone_repo changed it
+        # Ensure _repo is set if GitPython is available and clone was successful
         if Repo is not None:
-            try:
-                self._repo = Repo(self.local_path)
-            except InvalidGitRepositoryError as e:
-                logger.error(f"Cloned repository at {self.local_path} is not a valid Git repo: {e}")
-                raise RuntimeError(f"Cloned repository at {self.local_path} is not a valid Git repo.")
-            except Exception as e:
-                logger.error(f"An unexpected error occurred while opening cloned repository {self.local_path}: {e}")
-                raise RuntimeError(f"An unexpected error occurred while opening cloned repository {self.local_path}.")
-
-        logger.info(f"Repository {self.repo_url} successfully ensured at {self.local_path}.")
+            self._repo = Repo(self.local_path)
         return self.local_path
 
-    def read_code_files(self) -> Dict[Path, str]:  # Changed key type to Path
+    def read_code_files(self) -> Dict[str, str]:
         """Return a mapping of absolute file paths -> file contents for code files."""
-        # Ensure repo is cloned before reading files
-        self.ensure_repo()
-        files_dict = get_code_files(str(self.local_path))
-        # Convert keys to Path objects for consistency
-        return {Path(k): v for k, v in files_dict.items()}
+        self.ensure_repo()  # Ensure repo is cloned before reading files
+        return get_code_files(self.local_path)
 
     def ensure_clean_worktree(self, allow_untracked: bool = True) -> bool:
         """Return True if working tree is clean (or only allowed untracked files).
 
-        If GitPython is not available, this will return True (cannot check).
+        If Repo is not available this will return True (can't check).
         """
         if Repo is None:
             logger.warning("GitPython not available, cannot check for clean worktree. Assuming clean.")
             return True
 
-        # Ensure _repo is initialized
-        if self._repo is None:
-            try:
-                self.ensure_repo()  # This will initialize self._repo
-            except RuntimeError as e:
-                logger.error(f"Could not ensure repository for clean worktree check: {e}. Assuming clean.")
-                return True  # If we can't even get the repo, we can't check.
-
-        repo = self._repo
-        if repo is None:  # Should not happen after ensure_repo, but for type safety
-            return True
-
+        repo = self._get_git_repo()
         dirty = repo.is_dirty(untracked_files=not allow_untracked)
         if dirty:
-            logger.warning(f"Working tree at {self.local_path} is dirty.")
+            logger.warning(f"Working tree is dirty. Status:\n{repo.git.status('--porcelain')}")
         return not dirty
 
     def secret_scan(self, content: str) -> List[str]:
@@ -267,7 +217,7 @@ class Agent:
                 issues.append(name)
         return issues
 
-    def preview_edits(self, edits: Dict[str | Path, str]) -> Dict[Path, str]:  # Changed key type to Path
+    def preview_edits(self, edits: Dict[str, str]) -> Dict[str, str]:
         """Return unified diffs for the given edits (no files are changed by this call).
 
         Inputs:
@@ -275,55 +225,52 @@ class Agent:
 
         Returns mapping path -> unified diff string (empty string if new file with no old content).
         """
-        diffs: Dict[Path, str] = {}
+        diffs: Dict[str, str] = {}
 
-        # Ensure repo is available for reading HEAD
-        if Repo is not None and self._repo is None:
+        repo: Optional[Repo] = None
+        if Repo is not None:
             try:
-                self.ensure_repo()
+                repo = self._get_git_repo()
             except RuntimeError as e:
-                logger.warning(f"Could not ensure repository for previewing edits: {e}. Diffs might be less accurate.")
-                # Continue without _repo, will try to read from disk
+                logger.warning(f"Could not initialize Git repo for preview_edits: {e}. Will use file system for old content.")
 
-        for path_key, new_content in edits.items():
-            p = Path(path_key)
+        for rel_path, new_content in edits.items():
+            p = Path(rel_path)
             if not p.is_absolute():
-                abs_path = self.local_path / p
+                abs_path = Path(self.local_path) / rel_path
             else:
                 abs_path = p
 
-            # determine old content from HEAD if present
             old_content = ''
-            if Repo is not None and self._repo is not None:
+            if repo is not None:
+                # compute path relative to repo root for git show
                 try:
-                    repo_root = Path(self._repo.working_tree_dir)
+                    repo_root = Path(repo.working_tree_dir)
                     rel_to_root = str(abs_path.relative_to(repo_root))
                     # try to get file content at HEAD
                     try:
-                        old_content = self._repo.git.show(f'HEAD:{rel_to_root}')
-                    except GitCommandError:
-                        # File might be new or not in HEAD
+                        old_content = repo.git.show(f'HEAD:{rel_to_root}')
+                    except GitCommandError:  # File might be new or not in HEAD
                         old_content = ''
-                    except Exception as e:
-                        logger.debug(f"Unexpected error getting HEAD content for {rel_to_root}: {e}")
-                        old_content = ''
-                except ValueError:  # abs_path not relative to repo_root
-                    logger.debug(f"Path {abs_path} is not relative to repo root {repo_root}. Cannot get HEAD content.")
-                    old_content = ''
-                except Exception as e:
-                    logger.debug(f"Unexpected error determining repo_root or relative path: {e}")
-                    old_content = ''
-
-            # If no git available or HEAD content failed, try reading file from disk as old content (before edits)
-            if not old_content and abs_path.exists():
-                try:
-                    old_content = abs_path.read_text(encoding='utf-8')
-                except UnicodeDecodeError:
-                    logger.warning(f"Could not decode existing file {abs_path} with utf-8 for diff. Skipping old content.")
-                    old_content = ''
-                except OSError as e:
-                    logger.warning(f"Could not read existing file {abs_path} for diff: {e}. Skipping old content.")
-                    old_content = ''
+                except ValueError:  # abs_path is not relative to repo_root
+                    logger.warning(f"Path '{abs_path}' is outside repository root '{repo_root}'. Cannot get HEAD content.")
+                    # Fallback to reading from disk if not in repo
+                    if abs_path.exists():
+                        try:
+                            old_content = abs_path.read_text(encoding='utf-8')
+                        except UnicodeDecodeError:
+                            logger.warning(f"Could not decode existing file '{abs_path}' for diff. Using empty content.")
+                        except IOError as e:
+                            logger.warning(f"Could not read existing file '{abs_path}' for diff: {e}. Using empty content.")
+            else:
+                # if no git available, try reading file from disk as old content (before edits)
+                if abs_path.exists():
+                    try:
+                        old_content = abs_path.read_text(encoding='utf-8')
+                    except UnicodeDecodeError:
+                        logger.warning(f"Could not decode existing file '{abs_path}' for diff. Using empty content.")
+                    except IOError as e:
+                        logger.warning(f"Could not read existing file '{abs_path}' for diff: {e}. Using empty content.")
 
             # produce unified diff
             old_lines = old_content.splitlines(keepends=True)
@@ -331,101 +278,106 @@ class Agent:
             fromfile = str(abs_path)
             tofile = str(abs_path)
             ud = ''.join(difflib.unified_diff(old_lines, new_lines, fromfile=fromfile, tofile=tofile))
-            diffs[abs_path] = ud
+            diffs[str(abs_path)] = ud
 
         return diffs
 
-    def apply_edits(self, edits: Dict[str | Path, str]) -> List[Path]:
+    def apply_edits(self, edits: Dict[str, str], commit_message: Optional[str] = None, push: Optional[bool] = None, dry_run: bool = False) -> Optional[Dict[str, Any]]:
         """Apply edits to files in the working tree.
 
         Edits keys are paths relative to repository root (or absolute paths). Values
         are the file content to write. Directories will be created if missing.
 
-        This method only applies changes to the file system and stages them in Git
-        if GitPython is available. It does NOT commit or push.
+        If the Agent is configured with auto_push or `push=True` is provided, this
+        method will attempt to commit and push the changes automatically after applying.
 
-        Returns a list of absolute paths to files that were written.
+        If dry_run=True, no commit/push will be performed and a preview diffs dict
+        will be returned (same shape as commit_and_push dry_run output).
         """
-        written_paths: List[Path] = []
-        for path_key, content in edits.items():
+        written_paths: List[str] = []
+        for rel_path, content in edits.items():
             # permit both absolute and relative paths
-            p = Path(path_key)
+            p = Path(rel_path)
             if not p.is_absolute():
-                p = self.local_path / p
+                p = Path(self.local_path) / rel_path
 
-            p.parent.mkdir(parents=True, exist_ok=True)
+            # Ensure parent directories exist
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                logger.error(f"Failed to create parent directories for '{p}': {e}")
+                raise
+
+            # Write file content
             try:
                 p.write_text(content, encoding='utf-8')
-                written_paths.append(p)
-                logger.debug(f"Wrote content to {p}")
-            except OSError as e:
-                logger.error(f"Failed to write content to {p}: {e}")
-                raise RuntimeError(f"Failed to write content to {p}: {e}")
+                written_paths.append(str(p))
+            except IOError as e:
+                logger.error(f"Failed to write content to file '{p}': {e}")
+                raise
 
         # remember written files for preview/dry-run
         self._last_written_paths = written_paths
 
         # stage changes in Git index if Repo available
         if Repo is not None:
-            if self._repo is None:
-                try:
-                    self.ensure_repo()
-                except RuntimeError as e:
-                    logger.warning(f"Could not ensure repository for staging changes: {e}. Changes will not be staged.")
-                    return written_paths  # Cannot stage if repo not available
+            try:
+                repo = self._get_git_repo()
+                # Stage only the files that were explicitly written by this agent.
+                # This is more precise than repo.git.add(all=True) for apply_edits.
+                # If commit_and_push is called later, it will handle staging all relevant changes.
+                repo.index.add(written_paths)
+                logger.info(f"Staged {len(written_paths)} files written by agent.")
+            except GitCommandError as e:
+                logger.warning(f"Failed to stage files {written_paths}: {e}. Commit might still work if changes are detected.")
+            except RuntimeError as e:  # From _get_git_repo
+                logger.warning(f"GitPython repo not available for staging: {e}. Skipping staging.")
 
-            if self._repo is not None:  # Check again after ensure_repo
-                try:
-                    # Convert Path list to str list for GitPython
-                    self._repo.index.add([str(p) for p in written_paths])
-                    logger.info(f"Staged {len(written_paths)} files.")
-                except GitCommandError as e:
-                    logger.warning(f"Failed to stage changes for {written_paths}: {e}. Commit might still work if changes are detected.")
-                except Exception as e:
-                    logger.warning(f"An unexpected error occurred during staging changes: {e}. Commit might still work.")
-        else:
-            logger.debug("GitPython not available, skipping staging changes.")
+        # determine effective push behavior
+        push_effective = self.auto_push if push is None else bool(push)
 
-        return written_paths
+        if push_effective:
+            # commit_message fallback
+            msg = commit_message or 'Automated edits by agent'
+            return self.commit_and_push(message=msg, push=True, dry_run=dry_run)
 
-    def apply_and_push(self, edits: Dict[str | Path, str], message: str = 'Automated edits by agent', dry_run: bool = False) -> Dict[str, Any]:
+        return None
+
+    def apply_and_push(self, edits: Dict[str, str], message: str = 'Automated edits by agent', dry_run: bool = False) -> Dict[str, Any]:
         """Convenience: apply edits then commit and push (or dry-run)."""
-        self.apply_edits(edits)  # This now only applies and stages
-        # If dry_run, commit_and_push will generate diffs based on current worktree state
-        # which includes the just-applied edits.
-        return self.commit_and_push(message=message, push=True, dry_run=dry_run)
+        # This method now correctly delegates to apply_edits, which handles the commit/push logic.
+        result = self.apply_edits(edits, commit_message=message, push=True, dry_run=dry_run)
+        if result is None:
+            # This should not happen if push=True is passed and dry_run is handled within apply_edits.
+            # If apply_edits returns None, it means no push/dry_run happened, which contradicts apply_and_push's intent.
+            raise RuntimeError("apply_edits did not return a result when push was expected in apply_and_push.")
+        return result
 
-    def _paths_changed_by_worktree(self) -> List[Path]:
+    def _paths_changed_by_worktree(self) -> List[str]:
         """Return a list of paths that are changed in working tree (modified or untracked).
 
         Uses the repo status if available; otherwise returns last_written_paths.
         """
-        if Repo is None or self._repo is None:
-            # Fallback to last written paths if GitPython not available or repo not initialized
-            if not self._last_written_paths:
-                logger.warning("GitPython not available or repo not initialized, and no recent written paths. Cannot determine changed files.")
+        if Repo is None:
+            logger.warning("GitPython not available, cannot get changed paths from worktree. Returning last written paths.")
             return list(self._last_written_paths)
 
-        repo = self._repo
-        changed: List[Path] = []
         try:
+            repo = self._get_git_repo()
+            changed: List[str] = []
             # porcelain gives lines like ' M file' or '?? file'
             status = repo.git.status('--porcelain')
             for line in status.splitlines():
                 if not line.strip():
                     continue
-                # file path starts at position 3
-                path_str = line[3:].strip()  # .strip() to remove potential leading/trailing whitespace
-                abs_path = Path(repo.working_tree_dir) / path_str
+                # file path starts at position 3, strip any leading/trailing whitespace
+                path = line[3:].strip()
+                abs_path = str(Path(repo.working_tree_dir) / path)
                 changed.append(abs_path)
-            logger.debug(f"Detected {len(changed)} changed files via git status.")
-        except GitCommandError as e:
+            return changed
+        except (GitCommandError, RuntimeError) as e:  # RuntimeError from _get_git_repo
             logger.warning(f"Failed to get git status: {e}. Falling back to last written paths.")
-            changed = list(self._last_written_paths)
-        except Exception as e:
-            logger.warning(f"An unexpected error occurred getting git status: {e}. Falling back to last written paths.")
-            changed = list(self._last_written_paths)
-        return changed
+            return list(self._last_written_paths)
 
     def commit_and_push(self, message: str = 'Automated edits by agent', push: bool = False, author: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
         """Create a commit with current staged/unstaged changes and optionally push.
@@ -435,47 +387,40 @@ class Agent:
 
         Returns a dictionary with keys:
           - dry_run: bool
-          - diffs: mapping path -> unified diff (keys are Path objects)
-          - files: list of affected files (Path objects)
+          - diffs: mapping path -> unified diff
+          - files: list of affected files
           - commit: commit hash (only present when not dry_run and commit created)
         """
         if Repo is None:
             raise RuntimeError('GitPython required for commit_and_push')
 
-        if self._repo is None:
-            try:
-                self.ensure_repo()
-            except RuntimeError as e:
-                raise RuntimeError(f"Failed to initialize repository for commit_and_push: {e}")
-
-        repo = self._repo
-        if repo is None:  # Should not happen after ensure_repo, but for type safety
-            raise RuntimeError("Repository object is None after ensure_repo.")
+        repo = self._get_git_repo()
 
         # compute affected paths
-        affected_paths = self._paths_changed_by_worktree()
-        if not affected_paths and not dry_run:
-            logger.info("No changes detected in the working tree. Skipping commit.")
-            return {"dry_run": False, "diffs": {}, "files": [], "commit": None}
+        affected = self._paths_changed_by_worktree()
 
         if dry_run:
             # generate diffs for affected paths
-            edits_for_preview: Dict[Path, str] = {}
-            for p in affected_paths:
+            edits: Dict[str, str] = {}
+            for p in affected:
                 try:
-                    new_text = p.read_text(encoding='utf-8')
+                    new_text = Path(p).read_text(encoding='utf-8')
                 except UnicodeDecodeError:
-                    logger.warning(f"Could not decode file {p} for dry-run diff. Skipping.")
+                    logger.warning(f"Could not decode file '{p}' for dry-run diff. Using empty content.")
                     new_text = ''
-                except OSError as e:
-                    logger.warning(f"Could not read file {p} for dry-run diff: {e}. Skipping.")
+                except IOError as e:
+                    logger.warning(f"Could not read file '{p}' for dry-run diff: {e}. Using empty content.")
                     new_text = ''
-                edits_for_preview[p] = new_text
+                # provide repo-relative keys in preview_edits for nicer diffs
+                try:
+                    rel = os.path.relpath(p, repo.working_tree_dir)
+                    edits[rel] = new_text
+                except ValueError:  # Path not relative to repo_working_tree_dir
+                    logger.warning(f"Path '{p}' is outside repository root. Using absolute path for diff.")
+                    edits[p] = new_text
 
-            # preview_edits expects Dict[str | Path, str] and returns Dict[Path, str]
-            diffs = self.preview_edits(edits_for_preview)
-            # Convert Path keys/values to str for consistency with original output format
-            return {"dry_run": True, "diffs": {str(k): v for k, v in diffs.items()}, "files": [str(p) for p in affected_paths]}
+            diffs = self.preview_edits(edits)
+            return {"dry_run": True, "diffs": diffs, "files": affected}
 
         # non-dry run: run basic safety checks
         # ensure working tree is not dirty from unrelated changes
@@ -483,15 +428,15 @@ class Agent:
             raise RuntimeError('Working tree is dirty. Please commit or stash local changes before running the agent.')
 
         # scan for secrets in the new content of affected files
-        secret_issues: Dict[Path, List[str]] = {}
-        for p in affected_paths:
+        secret_issues: Dict[str, List[str]] = {}
+        for p in affected:
             try:
-                content = p.read_text(encoding='utf-8')
+                content = Path(p).read_text(encoding='utf-8')
             except UnicodeDecodeError:
-                logger.warning(f"Could not decode file {p} for secret scan. Skipping.")
+                logger.error(f"Could not decode file '{p}' for secret scan. Skipping.")
                 content = ''
-            except OSError as e:
-                logger.warning(f"Could not read file {p} for secret scan: {e}. Skipping.")
+            except IOError as e:
+                logger.error(f"Could not read file '{p}' for secret scan: {e}. Skipping.")
                 content = ''
             issues = self.secret_scan(content)
             if issues:
@@ -500,50 +445,52 @@ class Agent:
             raise RuntimeError(f'Secret patterns detected in files: {secret_issues}')
 
         try:
-            # add all changes (staged and unstaged)
+            # Add all changes (staged, modified, untracked) to the index.
+            # This ensures that all changes detected by _paths_changed_by_worktree
+            # are included in the commit.
             repo.git.add(all=True)
             logger.info("Staged all changes in the repository.")
+        except GitCommandError as e:
+            logger.error(f"Failed to stage all changes: {e}")
+            raise RuntimeError(f'Failed to stage changes for commit: {e}')
 
-            # quick check: nothing to commit
-            # After `add(all=True)`, we only need to check `repo.index.diff('HEAD')`.
+        # quick check: nothing to commit
+        try:
+            # Check if there are any changes in the index compared to HEAD
+            # After `add(all=True)`, `repo.index.diff('HEAD')` should capture all changes.
             if not repo.index.diff('HEAD'):
                 logger.info("No changes to commit after staging.")
-                return {"dry_run": False, "diffs": {}, "files": [str(p) for p in affected_paths], "commit": None}
+                return {"dry_run": False, "files": affected, "commit": None}
         except GitCommandError as e:
-            logger.error(f"Git command error during staging changes: {e}")
-            raise RuntimeError(f"Failed to stage changes for commit: {e}")
-        except Exception as e:
-            logger.error(f"An unexpected error occurred during staging changes: {e}")
-            raise RuntimeError(f"An unexpected error occurred during staging changes: {e}")
+            logger.warning(f"Failed to check for changes to commit: {e}. Proceeding with commit attempt.")
+        except Exception as e:  # Catch other unexpected errors during diff check
+            logger.warning(f"An unexpected error occurred during diff check: {e}. Proceeding with commit attempt.")
 
         try:
             if author:
                 c = repo.index.commit(message, author=author)
             else:
                 c = repo.index.commit(message)
-            logger.info(f"Successfully created commit: {c.hexsha}")
+            logger.info(f"Created commit: {c.hexsha}")
         except GitCommandError as e:
-            logger.error(f'Failed to create commit: {e}')
             raise RuntimeError(f'Failed to create commit: {e}')
-        except Exception as e:
-            logger.error(f'An unexpected error occurred while creating commit: {e}')
-            raise RuntimeError(f'An unexpected error occurred while creating commit: {e}')
+        except Exception as e:  # Catch other unexpected errors during commit
+            raise RuntimeError(f'An unexpected error occurred during commit: {e}')
 
         commit_hash = str(c.hexsha) if c is not None else None
 
         if push:
             try:
                 origin = repo.remote(name='origin')
-                origin.push(refspec=f'{self.branch}:{self.branch}')
-                logger.info(f"Successfully pushed commit {commit_hash} to origin/{self.branch}.")
+                # Push to the current branch
+                origin.push(self.branch)
+                logger.info(f"Pushed commit to origin/{self.branch}")
             except GitCommandError as e:
-                logger.error(f'Failed to push to remote: {e}')
                 raise RuntimeError(f'Failed to push to remote: {e}')
-            except Exception as e:
-                logger.error(f'An unexpected error occurred while pushing to remote: {e}')
-                raise RuntimeError(f'An unexpected error occurred while pushing to remote: {e}')
+            except Exception as e:  # Catch other unexpected errors during push
+                raise RuntimeError(f'An unexpected error occurred during push: {e}')
 
-        return {"dry_run": False, "diffs": {}, "files": [str(p) for p in affected_paths], "commit": commit_hash}
+        return {"dry_run": False, "files": affected, "commit": commit_hash}
 
 
 if __name__ == '__main__':
@@ -562,72 +509,64 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    # Initialize agent
+    # Configure logging for console output in __main__ if not already configured
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+
     agent = Agent(args.repo, args.branch, args.local, auto_push=args.auto_push)
 
-    # Ensure repo is ready
     try:
         agent.ensure_repo()
-    except RuntimeError as e:
-        logger.critical(f"Agent initialization failed: {e}")
-        exit(1)
+        edits: Dict[str, str] = {}
+        if args.edit:
+            for relpath, localfile in args.edit:
+                try:
+                    edits[relpath] = Path(localfile).read_text(encoding='utf-8')
+                except FileNotFoundError:
+                    logger.error(f"Local file '{localfile}' not found for edit path '{relpath}'. Exiting.")
+                    sys.exit(1)  # Exit if a specified edit file is missing
+                except UnicodeDecodeError:
+                    logger.error(f"Could not decode local file '{localfile}' for edit path '{relpath}'. Exiting.")
+                    sys.exit(1)
+                except IOError as e:
+                    logger.error(f"Error reading local file '{localfile}' for edit path '{relpath}': {e}. Exiting.")
+                    sys.exit(1)
 
-    edits: Dict[Path, str] = {}  # Changed key type to Path
-    if args.edit:
-        for relpath_str, localfile_str in args.edit:
-            try:
-                edits[Path(relpath_str)] = Path(localfile_str).read_text(encoding='utf-8')
-            except FileNotFoundError:
-                logger.error(f"Local file '{localfile_str}' not found for edit path '{relpath_str}'. Skipping.")
-                exit(1)
-            except UnicodeDecodeError:
-                logger.error(f"Could not decode local file '{localfile_str}' with utf-8. Skipping.")
-                exit(1)
-            except OSError as e:
-                logger.error(f"Error reading local file '{localfile_str}': {e}. Skipping.")
-                exit(1)
-
-    if edits:
-        # If auto_push is enabled or --push is explicitly given, use apply_and_push
-        if agent.auto_push or args.push:
-            logger.info("Applying edits and committing/pushing (due to auto_push or --push flag).")
-            res = agent.apply_and_push(edits, message=args.message, dry_run=args.dry_run)
+        if edits:
+            # Pass args.push directly. apply_edits will handle auto_push logic.
+            res = agent.apply_edits(edits, commit_message=args.message, push=args.push, dry_run=args.dry_run)
+            if res is not None and res.get('dry_run'):
+                print('Dry-run diffs:')
+                for p, d in res['diffs'].items():
+                    print('---', p)
+                    print(d)
+            elif res is not None and res.get('commit'):
+                print(f"Changes committed with hash: {res['commit']}")
+            elif res is not None:
+                print("Changes applied, but no commit/push performed (e.g., dry-run or push not enabled).")
         else:
-            # Otherwise, just apply edits (stage them)
-            logger.info("Applying edits (will be staged, not committed/pushed automatically).")
-            agent.apply_edits(edits)
-            # If dry_run is requested, we still need to show diffs for the applied (staged) changes
-            if args.dry_run:
-                logger.info("Dry-run requested after applying edits. Generating diffs for current worktree state.")
-                res = agent.commit_and_push(message=args.message, push=False, dry_run=True)
+            # If no edits, just perform commit_and_push based on current worktree state
+            result = agent.commit_and_push(args.message, push=args.push, dry_run=args.dry_run)
+            if result.get('dry_run'):
+                print('Dry-run diffs:')
+                for p, d in result['diffs'].items():
+                    print('---', p)
+                    print(d)
+            elif result.get('commit'):
+                print(f"Changes committed with hash: {result['commit']}")
             else:
-                res = None  # No commit/push, no dry-run output
+                print("No changes to commit or push.")
+        logger.info('Done')
 
-        if res is not None and res.get('dry_run'):
-            print('Dry-run diffs:')
-            for p_str, d in res['diffs'].items():  # res['diffs'] keys are str
-                print('---', p_str)
-                print(d)
-        elif res is not None and res.get('commit'):
-            logger.info(f"Commit created: {res['commit']}")
-            if args.push:
-                logger.info("Push was also performed.")
-        elif res is not None:
-            logger.info("Edits applied, but no commit/push action taken (or no changes to commit).")
-    else:
-        # No edits provided, just perform a commit/push action if requested
-        logger.info("No edits provided. Performing commit/push action if requested.")
-        result = agent.commit_and_push(args.message, push=args.push, dry_run=args.dry_run)
-        if result.get('dry_run'):
-            print('Dry-run diffs:')
-            for p_str, d in result['diffs'].items():  # result['diffs'] keys are str
-                print('---', p_str)
-                print(d)
-        elif result.get('commit'):
-            logger.info(f"Commit created: {result['commit']}")
-            if args.push:
-                logger.info("Push was also performed.")
-        else:
-            logger.info("No changes to commit or push action taken.")
-    logger.info('Done')
+    except RuntimeError as e:
+        logger.error(f"Agent operation failed: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.critical(f"An unexpected critical error occurred: {e}", exc_info=True)
+        sys.exit(1)
+
 ```

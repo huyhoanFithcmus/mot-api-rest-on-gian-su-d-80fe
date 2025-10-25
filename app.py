@@ -1,221 +1,363 @@
+Dưới đây là mã nguồn đã được sửa đổi theo các nhận xét và gợi ý, tập trung vào việc khắc phục lỗi, cải thiện hiệu năng (trong giới hạn của mô hình blocking hiện tại), tăng cường khả năng đọc, bảo trì và bảo mật.
+
+Để thực hiện các thay đổi này, tôi đã tạo thêm hai file mới: `config.py` để quản lý cấu hình và `utils.py` để chứa các hàm tiện ích, giúp `app.py` trở nên gọn gàng và dễ quản lý hơn.
+
+---
+
+**Cấu trúc file mới:**
+
+```
+project_root/
+├── app.py
+├── config.py
+└── utils.py
+```
+
+---
+
+### File: `config.py`
+
 ```python
 import os
-from flask import Flask, render_template, request, session, redirect, url_for, jsonify, flash, g
-from functools import wraps
-from models import User, db, add_user, get_user_by_username, get_all_users # Giả định các hàm này đã được tối ưu hoặc sẽ được tối ưu trong models.py
 
-# --- Docstring cho module ---
-"""
-File chính để chạy ứng dụng Flask.
-Quản lý các route, xác thực người dùng, và tương tác cơ sở dữ liệu.
-"""
+class Config:
+    """
+    Lớp cấu hình cho ứng dụng Flask.
+    Sử dụng biến môi trường để linh hoạt trong các môi trường triển khai khác nhau.
+    """
+    # Thư mục gốc để lưu trữ các file tải lên
+    # Mặc định là 'uploads', có thể ghi đè bằng biến môi trường UPLOAD_FOLDER
+    UPLOAD_FOLDER = os.environ.get('UPLOAD_FOLDER', 'uploads')
 
+    # Các phần mở rộng file được phép tải lên
+    ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv'}
+
+    # Đường dẫn đến script xử lý chính (ví dụ: main.py)
+    # Mặc định là 'main.py', có thể ghi đè bằng biến môi trường MAIN_SCRIPT_PATH
+    MAIN_SCRIPT_PATH = os.environ.get('MAIN_SCRIPT_PATH', 'main.py')
+
+    # Trình thông dịch Python để chạy script xử lý
+    # Mặc định là 'python', có thể ghi đè bằng biến môi trường PYTHON_EXECUTABLE
+    PYTHON_EXECUTABLE = os.environ.get('PYTHON_EXECUTABLE', 'python')
+
+    # Chế độ Debug của Flask.
+    # CỰC KỲ QUAN TRỌNG: LUÔN ĐẶT LÀ False TRONG MÔI TRƯỜNG PRODUCTION!
+    # Mặc định là False, có thể ghi đè bằng biến môi trường FLASK_DEBUG (ví dụ: 'True', '1')
+    DEBUG = os.environ.get('FLASK_DEBUG', 'False').lower() in ('true', '1', 't')
+
+    # Host và Port cho ứng dụng Flask
+    FLASK_HOST = os.environ.get('FLASK_HOST', '0.0.0.0')
+    FLASK_PORT = int(os.environ.get('FLASK_PORT', 5000))
+
+    # Cấu hình logging (có thể mở rộng thêm nếu cần)
+    LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+```
+
+---
+
+### File: `utils.py`
+
+```python
+import os
+import subprocess
+import json
+import logging
+import time
+from werkzeug.utils import secure_filename
+from typing import Tuple, Set
+
+# Lấy logger cho module utils
+logger = logging.getLogger(__name__)
+
+def allowed_file(filename: str, allowed_extensions: Set[str]) -> bool:
+    """
+    Kiểm tra xem tên file có phần mở rộng được phép hay không.
+
+    Args:
+        filename (str): Tên của file.
+        allowed_extensions (Set[str]): Một tập hợp các phần mở rộng file được phép.
+
+    Returns:
+        bool: True nếu phần mở rộng được phép, ngược lại là False.
+    """
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in allowed_extensions
+
+def save_and_organize_file(
+    file_storage,  # Kiểu FileStorage từ werkzeug
+    upload_folder: str,
+    allowed_extensions: Set[str]
+) -> Tuple[str, str]:
+    """
+    Lưu file đã tải lên, tạo một thư mục có dấu thời gian và di chuyển file vào đó.
+
+    Args:
+        file_storage: Đối tượng file đã tải lên từ request.files của Flask.
+        upload_folder (str): Thư mục cơ sở để lưu trữ các file tải lên.
+        allowed_extensions (Set[str]): Một tập hợp các phần mở rộng file được phép.
+
+    Returns:
+        Tuple[str, str]: Một tuple chứa (đường dẫn file cuối cùng, đường dẫn thư mục dấu thời gian).
+
+    Raises:
+        ValueError: Nếu không có file được chọn, tên file trống hoặc loại file không được phép.
+        IOError: Nếu có vấn đề khi lưu hoặc di chuyển file, hoặc tạo thư mục.
+    """
+    if not file_storage or file_storage.filename == '':
+        logger.error("Không có file được chọn hoặc tên file trống.")
+        raise ValueError("Không có file được chọn hoặc tên file trống.")
+
+    if not allowed_file(file_storage.filename, allowed_extensions):
+        logger.error(f"Loại file không được phép cho: {file_storage.filename}")
+        raise ValueError(f"Loại file '{file_storage.filename.rsplit('.', 1)[1]}' không được phép.")
+
+    filename = secure_filename(file_storage.filename)
+    initial_file_path = os.path.join(upload_folder, filename)
+
+    try:
+        file_storage.save(initial_file_path)
+        logger.info(f"File ban đầu đã được lưu tại: {initial_file_path}")
+    except Exception as e:
+        logger.exception(f"Lỗi khi lưu file ban đầu {initial_file_path}")
+        raise IOError(f"Không thể lưu file ban đầu: {e}")
+
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    timestamp_folder_path = os.path.join(upload_folder, timestamp)
+
+    try:
+        os.makedirs(timestamp_folder_path, exist_ok=True)
+        logger.info(f"Thư mục dấu thời gian đã được tạo: {timestamp_folder_path}")
+    except Exception as e:
+        logger.exception(f"Lỗi khi tạo thư mục dấu thời gian {timestamp_folder_path}")
+        # Cố gắng dọn dẹp file đã lưu ban đầu nếu việc tạo thư mục thất bại
+        if os.path.exists(initial_file_path):
+            os.remove(initial_file_path)
+            logger.warning(f"Đã dọn dẹp file ban đầu {initial_file_path} do lỗi tạo thư mục.")
+        raise IOError(f"Không thể tạo thư mục dấu thời gian: {e}")
+
+    final_file_path = os.path.join(timestamp_folder_path, filename)
+
+    try:
+        os.rename(initial_file_path, final_file_path)
+        logger.info(f"File đã được di chuyển từ {initial_file_path} đến: {final_file_path}")
+    except Exception as e:
+        logger.exception(f"Lỗi khi di chuyển file từ {initial_file_path} đến {final_file_path}")
+        # Cố gắng dọn dẹp file ban đầu nếu việc đổi tên thất bại
+        if os.path.exists(initial_file_path):
+            os.remove(initial_file_path)
+            logger.warning(f"Đã dọn dẹp file ban đầu {initial_file_path} do lỗi di chuyển file.")
+        # Xóa thư mục dấu thời gian rỗng nếu nó được tạo
+        if os.path.exists(timestamp_folder_path) and not os.listdir(timestamp_folder_path):
+            os.rmdir(timestamp_folder_path)
+            logger.warning(f"Đã dọn dẹp thư mục dấu thời gian rỗng {timestamp_folder_path}.")
+        raise IOError(f"Không thể di chuyển file: {e}")
+
+    return final_file_path, timestamp_folder_path
+
+def run_processing_script(
+    script_path: str,
+    python_executable: str,
+    input_file_path: str,
+    output_folder: str
+) -> subprocess.CompletedProcess:
+    """
+    Chạy một script Python bên ngoài với các đối số được chỉ định.
+
+    Args:
+        script_path (str): Đường dẫn đến script Python (ví dụ: 'main.py').
+        python_executable (str): Trình thông dịch Python (ví dụ: 'python', 'python3').
+        input_file_path (str): Đường dẫn đến file đầu vào cho script.
+        output_folder (str): Đường dẫn đến thư mục đầu ra cho script.
+
+    Returns:
+        subprocess.CompletedProcess: Đối tượng kết quả từ subprocess.run.
+
+    Raises:
+        FileNotFoundError: Nếu script_path hoặc python_executable không tìm thấy.
+        subprocess.CalledProcessError: Nếu script trả về mã lỗi khác 0.
+        Exception: Đối với các lỗi không mong muốn khác.
+    """
+    command = [python_executable, script_path, input_file_path, output_folder]
+    logger.info(f"Đang chạy lệnh: {' '.join(command)}")
+
+    try:
+        # Sử dụng text=True để xử lý xuống dòng phổ quát và giải mã stdout/stderr
+        result = subprocess.run(command, capture_output=True, text=True, check=True, encoding='utf-8')
+        logger.info(f"stdout của script: {result.stdout.strip()}")
+        if result.stderr:
+            logger.warning(f"stderr của script: {result.stderr.strip()}")
+        return result
+    except FileNotFoundError:
+        logger.exception(f"Không tìm thấy trình thông dịch Python '{python_executable}' hoặc script '{script_path}'.")
+        raise
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Script '{script_path}' thất bại với mã thoát {e.returncode}.")
+        logger.error(f"stdout của script: {e.stdout.strip()}")
+        logger.error(f"stderr của script: {e.stderr.strip()}")
+        raise
+    except Exception as e:
+        logger.exception(f"Một lỗi không mong muốn đã xảy ra khi chạy script '{script_path}'.")
+        raise
+
+def load_output_json(output_folder: str) -> dict:
+    """
+    Tải file 'output.json' từ thư mục được chỉ định.
+
+    Args:
+        output_folder (str): Thư mục nơi 'output.json' được mong đợi.
+
+    Returns:
+        dict: Dữ liệu JSON đã được phân tích cú pháp.
+
+    Raises:
+        FileNotFoundError: Nếu 'output.json' không tìm thấy.
+        json.JSONDecodeError: Nếu 'output.json' bị lỗi định dạng.
+        IOError: Đối với các vấn đề liên quan đến file khác.
+    """
+    output_json_path = os.path.join(output_folder, "output.json")
+    logger.info(f"Đang cố gắng tải JSON đầu ra từ: {output_json_path}")
+    try:
+        with open(output_json_path, 'r', encoding='utf-8') as f:
+            output_data = json.load(f)
+        logger.info(f"JSON đầu ra đã được tải thành công từ: {output_json_path}")
+        return output_data
+    except FileNotFoundError:
+        logger.error(f"Không tìm thấy file đầu ra: {output_json_path}")
+        raise
+    except json.JSONDecodeError:
+        logger.error(f"Lỗi giải mã JSON từ {output_json_path}. File có thể bị lỗi định dạng.")
+        raise
+    except Exception as e:
+        logger.exception(f"Một lỗi không mong muốn đã xảy ra khi đọc hoặc phân tích cú pháp {output_json_path}.")
+        raise IOError(f"Không thể đọc hoặc phân tích cú pháp JSON đầu ra: {e}")
+
+```
+
+---
+
+### File: `app.py`
+
+```python
+import os
+import logging
+import json
+import subprocess
+# Không cần import 'time' ở đây nữa vì nó đã được chuyển vào utils.py
+# Không cần import 'secure_filename' ở đây nữa vì nó đã được chuyển vào utils.py
+
+from flask import Flask, request, jsonify
+
+# Import cấu hình và các hàm tiện ích
+from config import Config
+from utils import save_and_organize_file, run_processing_script, load_output_json
+
+# --- Thiết lập ứng dụng Flask ---
 app = Flask(__name__)
+app.config.from_object(Config)
 
-# --- Cấu hình ứng dụng ---
-# SECRET_KEY: Cần được tạo ngẫu nhiên, đủ mạnh và được lưu trữ trong biến môi trường.
-# Đây là khóa bí mật dùng để ký các session cookie.
-# Cung cấp giá trị mặc định chỉ cho mục đích phát triển, KHÔNG SỬ DỤNG TRONG MÔI TRƯỜNG SẢN XUẤT.
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'a_very_insecure_default_key_for_dev_only_CHANGE_ME_IN_PROD')
-if app.config['SECRET_KEY'] == 'a_very_insecure_default_key_for_dev_only_CHANGE_ME_IN_PROD':
-    print("CẢNH BÁO: SECRET_KEY đang sử dụng giá trị mặc định không an toàn. Vui lòng đặt biến môi trường SECRET_KEY trong môi trường sản xuất.")
-
-# Cấu hình cơ sở dữ liệu
-# SQLALCHEMY_DATABASE_URI: Có thể được cấu hình qua biến môi trường để dễ dàng thay đổi giữa các môi trường (dev/prod).
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///database.db')
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
-# Khởi tạo SQLAlchemy với ứng dụng Flask
-db.init_app(app)
-
-# Tạo các bảng cơ sở dữ liệu nếu chúng chưa tồn tại.
-# CHÚ Ý: Trong môi trường sản xuất, nên sử dụng Flask-Migrate (hoặc Alembic)
-# để quản lý các thay đổi schema cơ sở dữ liệu một cách an toàn và có kiểm soát,
-# thay vì gọi db.create_all() trực tiếp mỗi khi ứng dụng khởi động.
-with app.app_context():
-    # Chỉ tạo bảng trong môi trường phát triển hoặc khi debug được bật.
-    # Điều này ngăn chặn việc ghi đè hoặc xung đột trong môi trường sản xuất.
-    if app.debug or os.environ.get('FLASK_ENV') == 'development':
-        db.create_all()
-
-
-# --- Helper Functions / Decorators ---
-
-def login_required(f):
-    """
-    Decorator để yêu cầu người dùng phải đăng nhập để truy cập route.
-    Nếu người dùng chưa đăng nhập, sẽ chuyển hướng đến trang đăng nhập và hiển thị thông báo.
-    Lưu đối tượng người dùng hiện tại vào `flask.g.user` để các hàm route có thể truy cập
-    mà không cần thay đổi chữ ký hàm.
-    """
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        user_id = session.get('user_id')
-        if not user_id:
-            flash('Vui lòng đăng nhập để truy cập trang này.', 'info')
-            return redirect(url_for('login'))
-        
-        current_user = User.query.get(user_id)
-        if not current_user:
-            # Xử lý trường hợp user_id có trong session nhưng user không tồn tại trong DB
-            session.pop('user_id', None) # Xóa user_id không hợp lệ khỏi session
-            flash('Tài khoản của bạn không còn tồn tại hoặc đã bị xóa. Vui lòng đăng nhập lại.', 'warning')
-            return redirect(url_for('login'))
-
-        g.user = current_user # Lưu đối tượng người dùng vào flask.g
-        return f(*args, **kwargs) # Gọi hàm gốc mà không truyền current_user làm đối số
-    return decorated_function
-
-
-def user_to_dict_safe(user):
-    """
-    Chuyển đổi đối tượng User thành dictionary, loại bỏ các trường nhạy cảm.
-    (Giả định hàm này sẽ nằm trong models.py hoặc là một phương thức của User model
-    để đảm bảo tính nhất quán và dễ bảo trì).
-    """
-    if user:
-        return {
-            'id': user.id,
-            'username': user.username,
-            # KHÔNG bao gồm password_hash hoặc các thông tin nhạy cảm khác
-            # Thêm các trường khác nếu cần, ví dụ: 'email': user.email
-        }
-    return None
-
+# --- Cấu hình Logging ---
+# Cấu hình logging cơ bản cho ứng dụng.
+# Trong môi trường production, có thể sử dụng cấu hình nâng cao hơn (ví dụ: ghi vào file, dịch vụ log).
+logging.basicConfig(level=app.config['LOG_LEVEL'], format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+app.logger.info("Ứng dụng Flask đã được khởi tạo với cấu hình.")
 
 # --- Routes ---
-
-@app.route('/')
-def index():
+@app.route('/upload', methods=['POST'])
+def upload_file():
     """
-    Route cho trang chủ của ứng dụng.
+    Xử lý việc tải lên file, lưu trữ file, chạy một script xử lý bên ngoài,
+    và trả về kết quả của script.
     """
-    return render_template('index.html')
+    app.logger.info("Đã nhận yêu cầu tải lên file.")
 
+    # 1. Kiểm tra xem có phần 'file' trong request hay không
+    if 'file' not in request.files:
+        app.logger.warning("Không có phần 'file' trong yêu cầu.")
+        return jsonify({"error": "Không có phần 'file' trong yêu cầu"}), 400
 
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    """
-    Route để đăng ký người dùng mới.
-    - Xử lý hiển thị form đăng ký (GET).
-    - Xử lý gửi dữ liệu đăng ký (POST).
-    - Kiểm tra tên người dùng đã tồn tại và hiển thị thông báo thân thiện.
-    - Sử dụng `flash` để hiển thị thông báo cho người dùng.
-    """
-    if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
+    file = request.files['file']
 
-        if not username or not password:
-            flash('Vui lòng điền đầy đủ tên người dùng và mật khẩu.', 'danger')
-            return render_template('register.html', username=username) # Giữ lại username đã nhập
+    # 2. Xử lý file và chạy script
+    try:
+        # Lưu và sắp xếp file đã tải lên
+        final_file_path, timestamp_folder_path = save_and_organize_file(
+            file, app.config['UPLOAD_FOLDER'], app.config['ALLOWED_EXTENSIONS']
+        )
+        app.logger.info(f"File '{file.filename}' đã được lưu và sắp xếp thành công trong '{timestamp_folder_path}'.")
 
-        if get_user_by_username(username):
-            flash('Tên người dùng đã tồn tại. Vui lòng chọn tên khác.', 'warning')
-            return render_template('register.html', username=username) # Giữ lại username đã nhập
-        
-        new_user = User(username=username)
-        new_user.set_password(password)
-        add_user(new_user)
-        flash('Đăng ký thành công! Vui lòng đăng nhập.', 'success')
-        return redirect(url_for('login'))
-    return render_template('register.html')
+        # Chạy script xử lý bên ngoài
+        run_processing_script(
+            app.config['MAIN_SCRIPT_PATH'],
+            app.config['PYTHON_EXECUTABLE'],
+            final_file_path,
+            timestamp_folder_path
+        )
+        app.logger.info(f"Script xử lý '{app.config['MAIN_SCRIPT_PATH']}' đã được thực thi thành công.")
 
+        # Tải dữ liệu JSON đầu ra từ thư mục có dấu thời gian
+        output_data = load_output_json(timestamp_folder_path)
+        app.logger.info("Dữ liệu JSON đầu ra đã được tải thành công.")
 
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    """
-    Route để đăng nhập người dùng.
-    - Xử lý hiển thị form đăng nhập (GET).
-    - Xử lý gửi dữ liệu đăng nhập (POST).
-    - Xác thực thông tin đăng nhập và thiết lập session.
-    - Sử dụng `flash` để hiển thị thông báo cho người dùng.
-    """
-    if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
-        user = get_user_by_username(username)
+        return jsonify(output_data), 200
 
-        if user and user.check_password(password):
-            session['user_id'] = user.id
-            flash(f'Chào mừng trở lại, {user.username}!', 'success')
-            return redirect(url_for('dashboard'))
-        else:
-            flash('Tên người dùng hoặc mật khẩu không đúng.', 'danger')
-            return render_template('login.html', username=username) # Giữ lại username đã nhập
-    return render_template('login.html')
+    except ValueError as e:
+        # Lỗi trong quá trình xác thực file hoặc xử lý ban đầu (ví dụ: loại file không được phép)
+        app.logger.error(f"Lỗi xử lý file từ phía client: {e}")
+        return jsonify({"error": str(e)}), 400
+    except IOError as e:
+        # Lỗi trong quá trình lưu file, tạo thư mục hoặc di chuyển file
+        app.logger.error(f"Lỗi hệ thống file phía máy chủ: {e}")
+        return jsonify({"error": f"Thao tác hệ thống file thất bại: {str(e)}"}), 500
+    except FileNotFoundError as e:
+        # Lỗi cụ thể nếu main.py hoặc trình thông dịch python không tìm thấy, hoặc output.json bị thiếu
+        app.logger.error(f"Không tìm thấy file hoặc trình thực thi bắt buộc: {e}")
+        if "output.json" in str(e):
+            return jsonify({"error": "Quá trình xử lý hoàn tất, nhưng không tìm thấy file đầu ra (output.json)."}), 500
+        return jsonify({"error": f"Lỗi cấu hình máy chủ: {str(e)}. Vui lòng kiểm tra đường dẫn script hoặc trình thực thi Python."}), 500
+    except subprocess.CalledProcessError as e:
+        # Lỗi nếu script bên ngoài trả về mã lỗi khác 0
+        app.logger.error(f"Script xử lý '{app.config['MAIN_SCRIPT_PATH']}' thất bại.")
+        app.logger.error(f"stdout của script: {e.stdout.strip()}")
+        app.logger.error(f"stderr của script: {e.stderr.strip()}")
+        return jsonify({"error": f"Quá trình xử lý thất bại: {e.stderr.strip()}"}), 500
+    except json.JSONDecodeError:
+        # Lỗi nếu output.json bị lỗi định dạng
+        app.logger.error(f"Lỗi giải mã output.json trong '{timestamp_folder_path}'. Định dạng JSON không hợp lệ.")
+        return jsonify({"error": "Quá trình xử lý hoàn tất, nhưng file đầu ra bị lỗi định dạng."}), 500
+    except Exception as e:
+        # Bắt tất cả các lỗi không mong muốn khác
+        app.logger.exception("Một lỗi không mong muốn đã xảy ra trong quá trình tải lên và xử lý file.")
+        return jsonify({"error": f"Một lỗi máy chủ không mong muốn đã xảy ra: {str(e)}"}), 500
 
-
-@app.route('/logout')
-def logout():
-    """
-    Route để đăng xuất người dùng.
-    - Xóa `user_id` khỏi session.
-    - Hiển thị thông báo đăng xuất thành công.
-    """
-    session.pop('user_id', None)
-    flash('Bạn đã đăng xuất thành công.', 'info')
-    return redirect(url_for('index'))
-
-
-@app.route('/dashboard')
-@login_required # Yêu cầu người dùng phải đăng nhập để truy cập trang này
-def dashboard():
-    """
-    Route cho trang bảng điều khiển của người dùng.
-    - Yêu cầu người dùng phải đăng nhập thông qua decorator `login_required`.
-    - Truy cập đối tượng người dùng hiện tại thông qua `g.user` (được thiết lập bởi decorator).
-    """
-    # Đối tượng người dùng hiện tại được lưu trong `g.user` bởi decorator `login_required`
-    return render_template('dashboard.html', user=g.user)
-
-
-@app.route('/api/data')
-@login_required # BẢO MẬT: Yêu cầu người dùng phải đăng nhập để truy cập endpoint API này
-def api_data():
-    """
-    Endpoint API trả về danh sách người dùng (có hỗ trợ phân trang).
-    - Yêu cầu người dùng phải đăng nhập.
-    - Triển khai phân trang để cải thiện hiệu năng khi số lượng người dùng lớn.
-    - Chỉ trả về các trường dữ liệu an toàn, không nhạy cảm.
-    """
-    page = request.args.get('page', 1, type=int)
-    per_page = request.args.get('per_page', 10, type=int)
-
-    # CHÚ Ý: Hàm `get_all_users` trong `models.py` nên được cập nhật để hỗ trợ phân trang
-    # trực tiếp ở cấp độ cơ sở dữ liệu (ví dụ: sử dụng `User.query.paginate(...)`)
-    # để tránh tải tất cả dữ liệu vào bộ nhớ, điều này rất quan trọng đối với hiệu năng.
-    # Ví dụ về cách gọi hàm phân trang từ models.py (nếu đã được cập nhật):
-    # paginated_users_obj = get_paginated_users(page=page, per_page=per_page)
-    # users = paginated_users_obj.items
-    # total_users = paginated_users_obj.total
-    # total_pages = paginated_users_obj.pages
-
-    # Tạm thời, nếu `get_all_users` chỉ trả về tất cả, ta sẽ thực hiện phân trang thủ công
-    # (ít hiệu quả hơn nếu số lượng người dùng rất lớn, nhưng khắc phục vấn đề bảo mật và cung cấp phân trang cơ bản)
-    all_users = get_all_users() # Giả định hàm này trả về một danh sách các đối tượng User
-    
-    start_index = (page - 1) * per_page
-    end_index = start_index + per_page
-    paginated_users = all_users[start_index:end_index]
-
-    users_data = [user_to_dict_safe(user) for user in paginated_users]
-    
-    # Cung cấp thông tin phân trang trong phản hồi API để client có thể xử lý
-    response = {
-        'users': users_data,
-        'page': page,
-        'per_page': per_page,
-        'total_users': len(all_users), # Cần lấy từ DB nếu dùng paginate hiệu quả
-        'total_pages': (len(all_users) + per_page - 1) // per_page # Cần lấy từ DB nếu dùng paginate hiệu quả
-    }
-    return jsonify(response)
-
-
+# --- Điểm vào ứng dụng ---
 if __name__ == '__main__':
-    # Chạy ứng dụng Flask.
-    # `debug=True` chỉ nên dùng trong môi trường phát triển vì nó kích hoạt debugger
-    # và tự động tải lại code khi có thay đổi, nhưng không an toàn cho môi trường sản xuất.
-    # Trong môi trường sản xuất, hãy sử dụng một WSGI server như Gunicorn hoặc uWSGI.
-    app.run(debug=True)
+    # Đảm bảo thư mục upload tồn tại khi ứng dụng khởi động
+    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+    app.logger.info(f"Đã đảm bảo thư mục UPLOAD_FOLDER '{app.config['UPLOAD_FOLDER']}' tồn tại.")
+
+    # GHI CHÚ VỀ HIỆU NĂNG:
+    # Việc gọi subprocess.run là một hoạt động blocking I/O.
+    # Nếu script 'main.py' chạy lâu, nó sẽ chặn toàn bộ worker của Flask,
+    # làm giảm khả năng xử lý các yêu cầu đồng thời.
+    # Đối với các tác vụ nặng hoặc chạy lâu trong môi trường production,
+    # nên cân nhắc sử dụng hàng đợi tác vụ (task queue) như Celery hoặc RQ.
+    # Flask có thể trả về một ID tác vụ ngay lập tức, và client có thể thăm dò
+    # một endpoint khác để kiểm tra trạng thái hoặc nhận kết quả khi tác vụ hoàn thành.
+
+    # GHI CHÚ VỀ DỌN DẸP FILE:
+    # Hiện tại, các thư mục có dấu thời gian và file bên trong không được tự động dọn dẹp.
+    # Trong môi trường production, cần triển khai một cơ chế dọn dẹp định kỳ
+    # (ví dụ: cron job) để xóa các thư mục cũ hơn một khoảng thời gian nhất định
+    # nhằm tránh làm đầy dung lượng lưu trữ.
+
+    # Chạy ứng dụng Flask
+    # CẢNH BÁO: debug=True KHÔNG BAO GIỜ được sử dụng trong môi trường production.
+    # Nó cho phép thực thi mã tùy ý từ trình duyệt và là một rủi ro bảo mật lớn.
+    app.run(
+        debug=app.config['DEBUG'],
+        host=app.config['FLASK_HOST'],
+        port=app.config['FLASK_PORT']
+    )
+    app.logger.info("Ứng dụng Flask đã dừng.")
+
 ```
